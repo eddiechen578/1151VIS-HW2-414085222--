@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>程式語言熱度動態長條圖 | Vue + D3.js</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=Fraunces:opsz,wght@9..144,600&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#e9eef3;--panel:#f7f9fb;--ink:#14263a;--muted:#5b6b7c;--line:#c9d3dd;--accent:#1d5fd1;}
+  @media (prefers-color-scheme: dark){:root{--bg:#0f1a26;--panel:#16263a;--ink:#e6edf5;--muted:#93a4b7;--line:#2a3d55;--accent:#6aa4ff;}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:"Noto Sans TC",system-ui,sans-serif;line-height:1.6}
+  .wrap{max-width:980px;margin:0 auto;padding:28px 18px 40px}
+  h1{font-family:"Fraunces","Noto Sans TC",serif;font-size:clamp(26px,4vw,38px);margin:0 0 4px;font-weight:600}
+  p.sub{margin:0 0 18px;color:var(--muted);max-width:60ch}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+  svg{width:100%;height:auto;display:block}
+  .year{font-family:"Fraunces",serif;font-size:120px;font-weight:600;fill:var(--ink);opacity:.12}
+  .lab{fill:var(--ink);font-size:14px;font-weight:500}
+  .val{fill:var(--muted);font-size:13px}
+  .bar{cursor:pointer;transition:opacity .2s}
+  .controls{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-top:14px}
+  button,select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 14px;cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;min-width:84px}
+  button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  input[type=range]{flex:1;min-width:180px;accent-color:var(--accent)}
+  .info{margin-top:12px;color:var(--muted);font-size:14px;min-height:1.6em}
+  .info b{color:var(--ink)}
+  footer{margin-top:20px;color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div id="app" class="wrap">
+  <h1>程式語言熱度動態長條圖</h1>
+  <p class="sub">用 Vue 3 管理播放狀態，D3.js 負責繪圖與轉場。按下播放，看排名如何隨年份變動；點擊長條可鎖定單一語言。</p>
+
+  <div class="panel">
+    <div ref="chart"></div>
+    <div class="controls">
+      <button class="primary" @click="toggle">{{ playing ? '暫停' : (year === END ? '重播' : '播放') }}</button>
+      <input type="range" :min="START" :max="END" step="1" v-model.number="year" aria-label="年份">
+      <label>速度
+        <select v-model.number="speed">
+          <option :value="1400">慢</option>
+          <option :value="900">中</option>
+          <option :value="450">快</option>
+        </select>
+      </label>
+    </div>
+    <div class="info">
+      <span v-if="picked">已鎖定 <b>{{ picked }}</b>：{{ year }} 年排名第 <b>{{ rankOf(picked) }}</b>，熱度指數 <b>{{ valueOf(picked).toFixed(1) }}</b>（再點一次取消）</span>
+      <span v-else>{{ year }} 年第一名：<b>{{ leader.name }}</b>（指數 {{ leader.value.toFixed(1) }}）</span>
+    </div>
+  </div>
+  <footer>資料為課堂練習用的示意數字（以 2010、2015、2020、2025 四個關鍵年份線性插值），非官方統計。</footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vue/3.4.21/vue.global.prod.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script>
+const { createApp, ref, computed, watch, onMounted, onBeforeUnmount } = Vue;
+
+const START = 2010, END = 2025, TOP = 10;
+const KEY_YEARS = [2010, 2015, 2020, 2025];
+const LANGS = [
+  ['Python',     '#2f6fb5', [9, 14, 28, 32]],
+  ['JavaScript', '#e0a800', [14, 20, 24, 26]],
+  ['Java',       '#c4483b', [26, 22, 18, 14]],
+  ['C/C++',      '#6a5acd', [22, 18, 14, 13]],
+  ['C#',         '#3a9a6b', [8, 8, 8, 9]],
+  ['PHP',        '#8a6fb0', [14, 10, 6, 3]],
+  ['TypeScript', '#1b8aa6', [0, 1, 5, 10]],
+  ['Go',         '#2bb3c0', [0, 1, 3, 5]],
+  ['Rust',       '#b5651d', [0, 0, 1, 4]],
+  ['Kotlin',     '#d9534f', [0, 0, 2, 3]],
+  ['Swift',      '#e8743b', [0, 2, 3, 3]],
+  ['Ruby',       '#a3303f', [7, 5, 2, 1]],
+].map(([name, color, v]) => ({ name, color, scale: d3.scaleLinear().domain(KEY_YEARS).range(v) }));
+
+// 取得某年所有語言的數值，並由大到小排序、取前 TOP 名
+const frame = y => LANGS.map(l => ({ name: l.name, color: l.color, value: l.scale(y) }))
+  .sort((a, b) => b.value - a.value).slice(0, TOP);
+
+createApp({
+  setup() {
+    const chart = ref(null);
+    const year = ref(START);
+    const playing = ref(false);
+    const speed = ref(900);
+    const picked = ref(null);
+    let timer = null, draw = null;
+
+    const rows = computed(() => frame(year.value));
+    const leader = computed(() => rows.value[0]);
+    const rankOf = n => { const i = rows.value.findIndex(d => d.name === n); return i < 0 ? '10 名外' : i + 1; };
+    const valueOf = n => LANGS.find(l => l.name === n).scale(year.value);
+
+    function build() {
+      const W = 900, H = 500, m = { t: 8, r: 60, b: 8, l: 110 };
+      const svg = d3.select(chart.value).append('svg').attr('viewBox', `0 0 ${W} ${H}`)
+        .attr('role', 'img').attr('aria-label', '各年份前十名程式語言熱度長條圖');
+      const x = d3.scaleLinear().domain([0, 36]).range([m.l, W - m.r]);
+      const y = d3.scaleBand().domain(d3.range(TOP)).range([m.t, H - m.b]).padding(0.18);
+      const yearText = svg.append('text').attr('class', 'year').attr('x', W - 20).attr('y', H - 24).attr('text-anchor', 'end');
+      const layer = svg.append('g');
+
+      draw = (data, dur) => {
+        yearText.text(Math.round(year.value));
+        const g = layer.selectAll('g.row').data(data, d => d.name).join(
+          enter => {
+            const e = enter.append('g').attr('class', 'row').attr('transform', `translate(0,${H})`);
+            e.append('rect').attr('class', 'bar').attr('x', m.l).attr('height', y.bandwidth()).attr('rx', 4)
+              .attr('fill', d => d.color).attr('width', 0)
+              .on('click', (ev, d) => { picked.value = picked.value === d.name ? null : d.name; });
+            e.append('text').attr('class', 'lab').attr('x', m.l - 8).attr('y', y.bandwidth() / 2).attr('dy', '.35em').attr('text-anchor', 'end').text(d => d.name);
+            e.append('text').attr('class', 'val').attr('dy', '.35em').attr('y', y.bandwidth() / 2).attr('x', m.l + 6);
+            return e;
+          },
+          update => update,
+          exit => exit.transition().duration(dur).ease(d3.easeLinear).attr('transform', `translate(0,${H})`).style('opacity', 0).remove()
+        );
+        const t = d3.transition().duration(dur).ease(d3.easeLinear);
+        g.transition(t).style('opacity', d => (!picked.value || picked.value === d.name) ? 1 : 0.2)
+          .attr('transform', (d, i) => `translate(0,${y(i)})`);
+        g.select('rect').transition(t).attr('width', d => x(d.value) - m.l);
+        g.select('.val').transition(t).attr('x', d => x(d.value) + 6)
+          .tween('text', function (d) {
+            const from = parseFloat(this.textContent) || 0, i = d3.interpolateNumber(from, d.value);
+            return k => { this.textContent = i(k).toFixed(1); };
+          });
+      };
+      draw(rows.value, 0);
+    }
+
+    function step() {
+      if (year.value >= END) { stop(); return; }
+      year.value += 1;
+    }
+    function start() {
+      if (year.value >= END) year.value = START;
+      playing.value = true;
+      clearInterval(timer);
+      timer = setInterval(step, speed.value);
+    }
+    function stop() { playing.value = false; clearInterval(timer); }
+    const toggle = () => playing.value ? stop() : start();
+
+    // 年份、鎖定狀態改變 → 重畫；拖曳滑桿時用短轉場
+    watch([year, picked], () => draw && draw(rows.value, playing.value ? speed.value : 250));
+    watch(speed, () => { if (playing.value) start(); });
+
+    onMounted(build);
+    onBeforeUnmount(() => clearInterval(timer));
+    return { chart, year, playing, speed, picked, leader, rankOf, valueOf, toggle, START, END };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
